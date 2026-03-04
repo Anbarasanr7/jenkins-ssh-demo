@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server curl git \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && ssh-keygen -A
+
+WORKDIR /workspace
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
