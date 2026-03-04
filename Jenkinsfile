@@ -1,16 +1,10 @@
+// Uses explicit /usr/local/bin/docker in shell steps so Jenkins does not need docker in its process PATH.
 pipeline {
-  agent {
-    dockerfile {
-      filename 'Dockerfile.jenkins'
-      // Expose SSH port from job container to Jenkins agent host
-      args '-p 2222:2222'
-      reuseNode true
-    }
-  }
+  agent any
 
   options {
     timestamps()
-    disableConcurrentBuilds() // avoids port collision for sample
+    disableConcurrentBuilds()
   }
 
   parameters {
@@ -25,6 +19,8 @@ pipeline {
   environment {
     TEST_EXIT_CODE = '0'
     DEBUG_PORT = '2222'
+    DOCKER = '/usr/local/bin/docker'
+    IMAGE_NAME = "jenkins-ssh-demo-${env.BUILD_NUMBER}"
   }
 
   stages {
@@ -32,14 +28,27 @@ pipeline {
       steps { checkout scm }
     }
 
+    stage('Build image') {
+      steps {
+        sh """
+          ${env.DOCKER} build -t ${env.IMAGE_NAME} -f Dockerfile.jenkins .
+        """
+      }
+    }
+
     stage('Test') {
       steps {
         script {
           def cmd = params.FORCE_FAIL ? 'FORCE_FAIL=true pytest -q' : 'pytest -q'
-          def code = sh(script: cmd, returnStatus: true)
+          def code = sh(
+            script: """
+              ${env.DOCKER} run --rm -v \"${env.WORKSPACE}:/workspace\" -w /workspace ${env.IMAGE_NAME} ${cmd}
+            """,
+            returnStatus: true
+          )
           env.TEST_EXIT_CODE = "${code}"
           if (code != 0) {
-            currentBuild.result = 'FAILURE' // mark red but continue to debug stage
+            currentBuild.result = 'FAILURE'
           }
         }
       }
@@ -58,17 +67,19 @@ pipeline {
           }
         }
 
-        sh '''
+        sh """
           set -euxo pipefail
-          mkdir -p /root/.ssh
-          chmod 700 /root/.ssh
-
-          curl -fsSL "https://github.com/${DEBUG_GITHUB_USER}.keys" > /root/.ssh/authorized_keys
-          test -s /root/.ssh/authorized_keys
-          chmod 600 /root/.ssh/authorized_keys
-
-          cat >/tmp/sshd_config <<EOF
-Port ${DEBUG_PORT}
+          CONTAINER=ssh-debug-\${BUILD_NUMBER}
+          ${env.DOCKER} run -d --name \$CONTAINER -p ${env.DEBUG_PORT}:${env.DEBUG_PORT} \\
+            -v \"${env.WORKSPACE}:/workspace\" -w /workspace \\
+            ${env.IMAGE_NAME} tail -f /dev/null
+          ${env.DOCKER} exec \$CONTAINER sh -c '
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh
+            curl -fsSL "https://github.com/${params.DEBUG_GITHUB_USER}.keys" > /root/.ssh/authorized_keys
+            test -s /root/.ssh/authorized_keys
+            chmod 600 /root/.ssh/authorized_keys
+            cat >/tmp/sshd_config <<EOF
+Port ${env.DEBUG_PORT}
 ListenAddress 0.0.0.0
 HostKey /etc/ssh/ssh_host_ed25519_key
 HostKey /etc/ssh/ssh_host_rsa_key
@@ -82,17 +93,16 @@ AuthorizedKeysFile /root/.ssh/authorized_keys
 PidFile /tmp/sshd.pid
 PrintMotd no
 EOF
-
-          /usr/sbin/sshd -f /tmp/sshd_config -E /tmp/sshd.log
-
+            /usr/sbin/sshd -f /tmp/sshd_config -E /tmp/sshd.log
+          '
           echo "====================================================="
           echo "SSH debug is ACTIVE"
           echo "Run from your laptop:"
-          echo "ssh -p ${DEBUG_PORT} root@${DEBUG_HOST}"
+          echo "ssh -p ${env.DEBUG_PORT} root@${params.DEBUG_HOST}"
           echo "After login, go to workspace:"
-          echo "cd ${WORKSPACE}"
+          echo "cd /workspace"
           echo "====================================================="
-        '''
+        """
 
         timeout(time: params.DEBUG_TIMEOUT_MIN as Integer, unit: 'MINUTES') {
           input message: 'SSH debug active. Click Proceed to end session.', ok: 'Proceed'
@@ -100,12 +110,13 @@ EOF
       }
       post {
         always {
-          sh '''
+          sh """
             set +e
-            if [ -f /tmp/sshd.pid ]; then
-              kill "$(cat /tmp/sshd.pid)"
-            fi
-          '''
+            CONTAINER=ssh-debug-\${BUILD_NUMBER}
+            ${env.DOCKER} exec \$CONTAINER sh -c 'test -f /tmp/sshd.pid && kill "\$(cat /tmp/sshd.pid)"' 2>/dev/null || true
+            ${env.DOCKER} stop \$CONTAINER 2>/dev/null || true
+            ${env.DOCKER} rm -f \$CONTAINER 2>/dev/null || true
+          """
         }
       }
     }
@@ -117,6 +128,14 @@ EOF
       steps {
         error('Tests failed (debug stage has already executed if enabled).')
       }
+    }
+  }
+
+  post {
+    always {
+      sh """
+        ${env.DOCKER} rmi -f ${env.IMAGE_NAME} 2>/dev/null || true
+      """
     }
   }
 }
